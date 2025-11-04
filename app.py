@@ -1,3 +1,4 @@
+# app.py - CORRECTED VERSION
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from groq import Groq
@@ -8,13 +9,26 @@ from dotenv import load_dotenv
 import logging
 from datetime import datetime, timedelta
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, Optional
+from flask_jwt_extended.exceptions import NoAuthorizationError
+# Authentication
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_jwt_extended import (
+    JWTManager, create_access_token, jwt_required, get_jwt_identity, 
+    unset_jwt_cookies, verify_jwt_in_request
+)
+
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__, static_folder='build', static_url_path='')
-CORS(app)
+CORS(app, supports_credentials=True, origins=['http://localhost:3000', 'http://localhost:5173'])
+
+# Setup JWT
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "supersecretkey123changethis")
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=12)
+jwt = JWTManager(app)
 
 # Setup logging
 logging.basicConfig(
@@ -32,6 +46,11 @@ user_data_dir = Path('user_data')
 logs_dir.mkdir(exist_ok=True)
 user_data_dir.mkdir(exist_ok=True)
 
+# Users file
+users_file = Path('users.json')
+if not users_file.exists():
+    users_file.write_text('[]')
+
 # Get Groq API key
 api_key = os.getenv('GROQ_API_KEY')
 if api_key:
@@ -40,33 +59,43 @@ else:
     client = None
     logging.warning("⚠️  GROQ_API_KEY not found in environment variables")
 
-# ======================= USER SESSION MANAGEMENT =======================
-
-def get_user_id():
-    """Generate or retrieve user session ID"""
-    session_id = request.headers.get('X-Session-ID')
-    if not session_id:
-        session_id = str(uuid.uuid4())
-    return session_id
-
-def get_user_profile(user_id: str) -> Dict:
-    """Load user profile and history"""
-    profile_file = user_data_dir / f'{user_id}.json'
-    
-    if profile_file.exists():
-        with open(profile_file, 'r') as f:
+# ---------------------------
+# Utility: Users store
+# ---------------------------
+def load_users():
+    try:
+        with open(users_file, 'r') as f:
             return json.load(f)
-    
-    # Default profile
+    except Exception:
+        return []
+
+def save_users(users):
+    with open(users_file, 'w') as f:
+        json.dump(users, f, indent=2)
+
+def find_user_by_email(email: str) -> Optional[Dict]:
+    users = load_users()
+    return next((u for u in users if u.get('email') == email), None)
+
+def find_user_by_id(user_id: str) -> Optional[Dict]:
+    users = load_users()
+    return next((u for u in users if u.get('id') == user_id), None)
+
+# ---------------------------
+# Profile helpers
+# ---------------------------
+def default_profile_for_user(user_id: str, email: str, username: str) -> Dict:
     return {
         'user_id': user_id,
+        'email': email,
+        'username': username,
         'created_at': datetime.now().isoformat(),
         'profile': {
             'name': None,
             'age': None,
             'weight': None,
             'height': None,
-            'fitness_level': None,
+            'fitness_level': 'beginner',
             'health_goals': [],
             'dietary_preferences': [],
             'medical_conditions': []
@@ -85,16 +114,26 @@ def get_user_profile(user_id: str) -> Dict:
         }
     }
 
-def save_user_profile(user_id: str, profile: Dict):
-    """Save user profile"""
-    profile_file = user_data_dir / f'{user_id}.json'
-    with open(profile_file, 'w') as f:
+def profile_path_for_user_id(user_id: str) -> Path:
+    return user_data_dir / f'{user_id}.json'
+
+def load_profile_by_user_id(user_id: str) -> Dict:
+    p = profile_path_for_user_id(user_id)
+    if p.exists():
+        with open(p, 'r') as f:
+            return json.load(f)
+    return default_profile_for_user(user_id, "", "")
+
+def save_profile_by_user_id(user_id: str, profile: Dict):
+    p = profile_path_for_user_id(user_id)
+    with open(p, 'w') as f:
         json.dump(profile, f, indent=2)
 
+# ---------------------------
+# Logging interactions
+# ---------------------------
 def log_interaction(user_id: str, message: str, response: str, category: str = None):
-    """Log user interactions"""
     log_file = logs_dir / f'interactions_{datetime.now().strftime("%Y-%m-%d")}.json'
-    
     log_entry = {
         'timestamp': datetime.now().isoformat(),
         'user_id': user_id,
@@ -103,24 +142,21 @@ def log_interaction(user_id: str, message: str, response: str, category: str = N
         'response': response[:200] + '...' if len(response) > 200 else response,
         'ip_address': request.remote_addr
     }
-    
     try:
         if log_file.exists():
             with open(log_file, 'r') as f:
                 logs = json.load(f)
         else:
             logs = []
-        
         logs.append(log_entry)
-        
         with open(log_file, 'w') as f:
             json.dump(logs, f, indent=2)
-            
     except Exception as e:
         logging.error(f"Failed to write log: {e}")
 
-# ======================= HEALTH COACH SYSTEM PROMPTS =======================
-
+# ---------------------------
+# System prompts & AI helper
+# ---------------------------
 SYSTEM_PROMPTS = {
     'nutrition': """You are an expert nutritionist and meal planning specialist. 
     Help users create balanced, nutritious meal plans based on their goals, dietary preferences, and restrictions.
@@ -154,118 +190,176 @@ SYSTEM_PROMPTS = {
     If asked about medical conditions, remind users to consult healthcare professionals."""
 }
 
-# ======================= AI RESPONSE GENERATION =======================
+def detect_intent(message: str) -> str:
+    message_lower = message.lower()
+    keywords = {
+        'nutrition': ['meal', 'diet', 'food', 'eat', 'nutrition', 'calorie', 'recipe', 'hungry'],
+        'fitness': ['workout', 'exercise', 'train', 'gym', 'fitness', 'muscle', 'cardio', 'strength'],
+        'schedule': ['schedule', 'plan', 'routine', 'time', 'organize', 'calendar', 'daily'],
+        'wellness': ['sleep', 'stress', 'mental', 'relax', 'meditation', 'wellness', 'tired', 'anxiety'],
+        'goals': ['goal', 'target', 'achieve', 'motivation', 'progress', 'milestone'],
+        'analytics': ['track', 'progress', 'analyze', 'data', 'metrics', 'statistics', 'report']
+    }
+    for category, words in keywords.items():
+        if any(word in message_lower for word in words):
+            return category
+    return 'general'
 
 def generate_health_response(message: str, category: Optional[str], user_profile: Dict) -> str:
-    """Generate AI response using Groq"""
-    
     if not client:
-        return "I'm currently unavailable. Please ensure the GROQ_API_KEY is configured properly. 🔧"
+        return "🔧 I'm currently unavailable. Please ensure the GROQ_API_KEY is configured in your .env file."
     
-    # Select appropriate system prompt
     system_prompt = SYSTEM_PROMPTS.get(category, SYSTEM_PROMPTS['general'])
     
-    # Build context from user profile
+    # Build user context
+    fitness_level = user_profile['profile'].get('fitness_level', 'Not specified')
+    health_goals = ', '.join(user_profile['profile'].get('health_goals', [])) or 'Not specified'
+    dietary_prefs = ', '.join(user_profile['profile'].get('dietary_preferences', [])) or 'Not specified'
+    medical_conditions = ', '.join(user_profile['profile'].get('medical_conditions', [])) or 'None reported'
+    
     user_context = f"""
 USER PROFILE:
-- Fitness Level: {user_profile['profile'].get('fitness_level', 'Not specified')}
-- Health Goals: {', '.join(user_profile['profile'].get('health_goals', [])) or 'Not specified'}
-- Dietary Preferences: {', '.join(user_profile['profile'].get('dietary_preferences', [])) or 'Not specified'}
-- Medical Conditions: {', '.join(user_profile['profile'].get('medical_conditions', [])) or 'None reported'}
+- Fitness Level: {fitness_level}
+- Health Goals: {health_goals}
+- Dietary Preferences: {dietary_prefs}
+- Medical Conditions: {medical_conditions}
 """
     
-    # Build conversation prompt
-    prompt = f"""{system_prompt}
-
-{user_context}
+    full_prompt = f"""{user_context}
 
 USER MESSAGE: {message}
 
 INSTRUCTIONS:
 - Provide a helpful, personalized response based on the user's profile and message
-- Use markdown formatting for better readability (bold, lists, etc.)
-- Keep responses concise but informative (aim for 150-300 words)
+- Keep responses concise but informative (150-300 words)
 - Include actionable advice and specific recommendations
-- Use emojis sparingly to make responses engaging
+- Use formatting for better readability
 - If creating plans, use structured formats with clear sections
 - Always encourage and motivate the user
+- For medical questions, remind them to consult healthcare professionals
 
 Response:"""
-
+    
     try:
         chat_completion = client.chat.completions.create(
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": full_prompt}
             ],
             model="llama-3.3-70b-versatile",
             temperature=0.7,
             max_tokens=1024,
         )
-        
         return chat_completion.choices[0].message.content
-        
     except Exception as e:
         logging.error(f"Groq API error: {e}")
-        return f"I encountered an issue processing your request. Please try again! 💪"
+        return "💪 I encountered an issue processing your request. Please try again!"
 
-# ======================= SMART FEATURES =======================
+# ---------------------------
+# AUTH ROUTES
+# ---------------------------
+@app.route("/api/auth/register", methods=["POST"])
+def register_user():
+    try:
+        data = request.get_json(force=True)
+        email = (data.get("email") or "").strip().lower()
+        username = (data.get("username") or "").strip()
+        password = data.get("password") or ""
 
-def detect_intent(message: str) -> str:
-    """Detect user intent from message"""
-    message_lower = message.lower()
-    
-    keywords = {
-        'nutrition': ['meal', 'diet', 'food', 'eat', 'nutrition', 'calorie', 'recipe'],
-        'fitness': ['workout', 'exercise', 'train', 'gym', 'fitness', 'muscle', 'cardio'],
-        'schedule': ['schedule', 'plan', 'routine', 'time', 'organize', 'calendar'],
-        'wellness': ['sleep', 'stress', 'mental', 'relax', 'meditation', 'wellness', 'tired'],
-        'goals': ['goal', 'target', 'achieve', 'motivation', 'progress'],
-        'analytics': ['track', 'progress', 'analyze', 'data', 'metrics', 'statistics']
-    }
-    
-    for category, words in keywords.items():
-        if any(word in message_lower for word in words):
-            return category
-    
-    return 'general'
+        if not email or not username or not password:
+            return jsonify({"detail": "All fields required"}), 400
 
-def generate_meal_plan(user_profile: Dict, preferences: str = "") -> Dict:
-    """Generate a structured meal plan"""
-    prompt = f"""Create a one-day meal plan with breakfast, lunch, dinner, and 2 snacks.
-    
-User preferences: {preferences}
-Dietary restrictions: {', '.join(user_profile['profile'].get('dietary_preferences', []))}
+        if find_user_by_email(email):
+            return jsonify({"detail": "Email already registered"}), 400
 
-Format as JSON with this structure:
-{{
-  "breakfast": {{"meal": "...", "calories": 000, "protein": 00}},
-  "lunch": {{"meal": "...", "calories": 000, "protein": 00}},
-  "dinner": {{"meal": "...", "calories": 000, "protein": 00}},
-  "snacks": [{{"meal": "...", "calories": 000}}]
-}}"""
-    
-    # This is a placeholder - you can enhance with actual Groq call
-    return {
-        "breakfast": {"meal": "Oatmeal with berries and almonds", "calories": 350, "protein": 12},
-        "lunch": {"meal": "Grilled chicken salad with quinoa", "calories": 450, "protein": 35},
-        "dinner": {"meal": "Salmon with roasted vegetables", "calories": 500, "protein": 40},
-        "snacks": [
-            {"meal": "Greek yogurt with honey", "calories": 150},
-            {"meal": "Apple with almond butter", "calories": 200}
-        ]
-    }
+        user_id = str(uuid.uuid4())
+        hashed_pw = generate_password_hash(password)
 
-# ======================= API ENDPOINTS =======================
+        new_user = {
+            "id": user_id,
+            "email": email,
+            "username": username,
+            "password": hashed_pw,
+            "created_at": datetime.now().isoformat()
+        }
+        users = load_users()
+        users.append(new_user)
+        save_users(users)
 
+        # Create default profile
+        profile = default_profile_for_user(user_id, email, username)
+        save_profile_by_user_id(user_id, profile)
+
+        logging.info(f"✅ New user registered: {username} ({email})")
+        return jsonify({
+            "message": "User registered successfully",
+            "email": email,
+            "username": username
+        }), 201
+    except Exception as e:
+        logging.error(f"Registration error: {e}")
+        return jsonify({"detail": "Failed to register user"}), 500
+
+@app.route("/api/auth/login", methods=["POST"])
+def login_user():
+    try:
+        data = request.get_json(force=True)
+        email = (data.get("email") or "").strip().lower()
+        password = data.get("password") or ""
+
+        user = find_user_by_email(email)
+        if not user or not check_password_hash(user.get("password", ""), password):
+            return jsonify({"detail": "Invalid email or password"}), 401
+
+        access_token = create_access_token(identity=user["id"])
+        
+        logging.info(f"✅ User logged in: {user['username']}")
+        return jsonify({
+            "access_token": access_token,
+            "user": {
+                "id": user["id"],
+                "email": user["email"],
+                "username": user["username"]
+            }
+        })
+    except Exception as e:
+        logging.error(f"Login error: {e}")
+        return jsonify({"detail": "Failed to login"}), 500
+
+@app.route("/api/auth/me", methods=["GET"])
+@jwt_required()
+def get_current_user():
+    try:
+        user_id = get_jwt_identity()
+        user = find_user_by_id(user_id)
+        if not user:
+            return jsonify({"detail": "User not found"}), 404
+        
+        return jsonify({
+            "id": user["id"],
+            "email": user["email"],
+            "username": user["username"],
+            "created_at": user.get("created_at")
+        })
+    except Exception as e:
+        logging.error(f"/auth/me error: {e}")
+        return jsonify({"detail": "Failed to fetch user"}), 500
+
+@app.route("/api/auth/logout", methods=["POST"])
+def logout():
+    resp = jsonify({"msg": "Logged out successfully"})
+    unset_jwt_cookies(resp)
+    return resp
+
+# ---------------------------
+# MAIN ROUTES
+# ---------------------------
 @app.route('/')
 def serve_frontend():
-    """Serve React frontend"""
     return send_from_directory(app.static_folder, 'index.html')
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
         'message': 'Smart Health Coach API is running',
@@ -275,36 +369,41 @@ def health_check():
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    """Main chat endpoint"""
+    """Chat endpoint - works for both anonymous and logged-in users"""
     try:
-        data = request.get_json()
-        message = data.get('message', '').strip()
+        data = request.get_json(force=True)
+        message = (data.get('message') or '').strip()
         category = data.get('category')
-        
+
         if not message:
             return jsonify({'error': 'Message is required'}), 400
+
+        # Try to get JWT user, fallback to session
+        user_id = None
+        try:
+            verify_jwt_in_request_optional()
+            user_id = get_jwt_identity()
+        except:
+            user_id = None
+
+        if not user_id:
+            session_id = request.headers.get('X-Session-ID') or str(uuid.uuid4())
+            user_id = session_id
+
+        user_profile = load_profile_by_user_id(user_id)
         
-        # Get user session
-        user_id = get_user_id()
-        user_profile = get_user_profile(user_id)
-        
-        # Auto-detect category if not provided
         if not category:
             category = detect_intent(message)
-        
-        # Generate AI response
+
         ai_response = generate_health_response(message, category, user_profile)
-        
-        # Log interaction
         log_interaction(user_id, message, ai_response, category)
-        
+
         return jsonify({
             'response': ai_response,
             'category': category,
             'session_id': user_id,
             'success': True
         })
-        
     except Exception as e:
         logging.error(f"Chat error: {e}")
         return jsonify({
@@ -313,96 +412,79 @@ def chat():
         }), 500
 
 @app.route('/api/profile', methods=['GET', 'POST'])
+@jwt_required()
 def user_profile():
     """Get or update user profile"""
-    user_id = get_user_id()
-    
-    if request.method == 'GET':
-        profile = get_user_profile(user_id)
-        return jsonify({
-            'profile': profile,
-            'success': True
-        })
-    
-    elif request.method == 'POST':
-        try:
-            data = request.get_json()
-            profile = get_user_profile(user_id)
+    try:
+        user_id = get_jwt_identity()
+        
+        if request.method == 'GET':
+            profile = load_profile_by_user_id(user_id)
+            return jsonify(profile)
+        else:
+            data = request.get_json(force=True)
+            profile = load_profile_by_user_id(user_id)
             
-            # Update profile fields
             if 'profile' in data:
                 profile['profile'].update(data['profile'])
-            
             if 'preferences' in data:
                 profile['preferences'].update(data['preferences'])
             
-            save_user_profile(user_id, profile)
+            save_profile_by_user_id(user_id, profile)
+            logging.info(f"✅ Profile updated for user: {user_id}")
             
             return jsonify({
                 'message': 'Profile updated successfully',
                 'profile': profile,
                 'success': True
             })
-            
-        except Exception as e:
-            logging.error(f"Profile update error: {e}")
-            return jsonify({
-                'error': 'Failed to update profile',
-                'success': False
-            }), 500
+    except Exception as e:
+        logging.error(f"Profile error: {e}")
+        return jsonify({'error': 'Failed to update profile', 'success': False}), 500
 
 @app.route('/api/metrics', methods=['GET', 'POST'])
+@jwt_required()
 def health_metrics():
-    """Get or log health metrics"""
-    user_id = get_user_id()
-    profile = get_user_profile(user_id)
-    
-    if request.method == 'GET':
-        return jsonify({
-            'metrics': profile['history'].get('health_metrics', []),
-            'success': True
-        })
-    
-    elif request.method == 'POST':
-        try:
-            data = request.get_json()
+    """Log or retrieve health metrics"""
+    try:
+        user_id = get_jwt_identity()
+        profile = load_profile_by_user_id(user_id)
+        
+        if request.method == 'GET':
+            return jsonify({
+                'metrics': profile['history'].get('health_metrics', []),
+                'success': True
+            })
+        else:
+            data = request.get_json(force=True)
             metric_entry = {
                 'timestamp': datetime.now().isoformat(),
-                'type': data.get('type'),  # steps, calories, water, sleep
+                'type': data.get('type'),
                 'value': data.get('value'),
                 'unit': data.get('unit')
             }
-            
             profile['history']['health_metrics'].append(metric_entry)
-            save_user_profile(user_id, profile)
+            save_profile_by_user_id(user_id, profile)
             
-            return jsonify({
-                'message': 'Metric logged successfully',
-                'success': True
-            })
-            
-        except Exception as e:
-            logging.error(f"Metric logging error: {e}")
-            return jsonify({
-                'error': 'Failed to log metric',
-                'success': False
-            }), 500
+            return jsonify({'message': 'Metric logged successfully', 'success': True})
+    except Exception as e:
+        logging.error(f"Metric logging error: {e}")
+        return jsonify({'error': 'Failed to log metric', 'success': False}), 500
 
 @app.route('/api/workout/generate', methods=['POST'])
+@jwt_required()
 def generate_workout():
     """Generate personalized workout plan"""
     try:
-        user_id = get_user_id()
-        user_profile = get_user_profile(user_id)
-        data = request.get_json()
+        user_id = get_jwt_identity()
+        user_profile = load_profile_by_user_id(user_id)
+        data = request.get_json(force=True)
         
         duration = data.get('duration', '30 minutes')
         focus = data.get('focus', 'full body')
         equipment = data.get('equipment', 'none')
         
         prompt = f"""Create a {duration} {focus} workout plan.
-        
-User fitness level: {user_profile['profile'].get('fitness_level', 'beginner')}
 Available equipment: {equipment}
 
 Provide 5-7 exercises with:
@@ -411,75 +493,77 @@ Provide 5-7 exercises with:
 - Brief form tips
 - Rest periods
 
-Format with clear structure using markdown."""
-
+Format with clear structure."""
+        
         response = generate_health_response(prompt, 'fitness', user_profile)
         
-        return jsonify({
-            'workout_plan': response,
-            'success': True
-        })
+        # Save to history
+        workout_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'duration': duration,
+            'focus': focus,
+            'equipment': equipment,
+            'plan': response
+        }
+        user_profile['history']['workouts'].append(workout_entry)
+        save_profile_by_user_id(user_id, user_profile)
         
+        return jsonify({'workout_plan': response, 'success': True})
     except Exception as e:
         logging.error(f"Workout generation error: {e}")
-        return jsonify({
-            'error': 'Failed to generate workout',
-            'success': False
-        }), 500
+        return jsonify({'error': 'Failed to generate workout', 'success': False}), 500
 
 @app.route('/api/meal-plan/generate', methods=['POST'])
+@jwt_required()
 def generate_meal():
     """Generate personalized meal plan"""
     try:
-        user_id = get_user_id()
-        user_profile = get_user_profile(user_id)
-        data = request.get_json()
+        user_id = get_jwt_identity()
+        user_profile = load_profile_by_user_id(user_id)
+        data = request.get_json(force=True)
         
         meal_type = data.get('meal_type', 'full day')
         preferences = data.get('preferences', '')
         
         prompt = f"""Create a {meal_type} meal plan.
-
-User preferences: {preferences}
-Dietary restrictions: {', '.join(user_profile['profile'].get('dietary_preferences', []))}
-Health goals: {', '.join(user_profile['profile'].get('health_goals', []))}
+Preferences: {preferences}
 
 Include:
 - Meal names with ingredients
 - Approximate calories and macros
 - Preparation tips
 
-Format with clear structure using markdown."""
-
+Format with clear structure."""
+        
         response = generate_health_response(prompt, 'nutrition', user_profile)
         
-        return jsonify({
-            'meal_plan': response,
-            'success': True
-        })
+        # Save to history
+        meal_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'type': meal_type,
+            'preferences': preferences,
+            'plan': response
+        }
+        user_profile['history']['meals'].append(meal_entry)
+        save_profile_by_user_id(user_id, user_profile)
         
+        return jsonify({'meal_plan': response, 'success': True})
     except Exception as e:
         logging.error(f"Meal plan generation error: {e}")
-        return jsonify({
-            'error': 'Failed to generate meal plan',
-            'success': False
-        }), 500
+        return jsonify({'error': 'Failed to generate meal plan', 'success': False}), 500
 
 @app.route('/api/goals', methods=['GET', 'POST'])
+@jwt_required()
 def manage_goals():
-    """Get or create health goals"""
-    user_id = get_user_id()
-    profile = get_user_profile(user_id)
-    
-    if request.method == 'GET':
-        return jsonify({
-            'goals': profile['history'].get('goals', []),
-            'success': True
-        })
-    
-    elif request.method == 'POST':
-        try:
-            data = request.get_json()
+    """Create or retrieve goals"""
+    try:
+        user_id = get_jwt_identity()
+        profile = load_profile_by_user_id(user_id)
+        
+        if request.method == 'GET':
+            return jsonify({'goals': profile['history'].get('goals', []), 'success': True})
+        else:
+            data = request.get_json(force=True)
             goal = {
                 'id': str(uuid.uuid4()),
                 'title': data.get('title'),
@@ -490,31 +574,23 @@ def manage_goals():
                 'completed': False,
                 'progress': 0
             }
-            
             profile['history']['goals'].append(goal)
-            save_user_profile(user_id, profile)
+            save_profile_by_user_id(user_id, profile)
             
-            return jsonify({
-                'message': 'Goal created successfully',
-                'goal': goal,
-                'success': True
-            })
-            
-        except Exception as e:
-            logging.error(f"Goal creation error: {e}")
-            return jsonify({
-                'error': 'Failed to create goal',
-                'success': False
-            }), 500
+            logging.info(f"✅ Goal created for user {user_id}: {goal['title']}")
+            return jsonify({'message': 'Goal created successfully', 'goal': goal, 'success': True})
+    except Exception as e:
+        logging.error(f"Goal creation error: {e}")
+        return jsonify({'error': 'Failed to create goal', 'success': False}), 500
 
 @app.route('/api/analytics', methods=['GET'])
+@jwt_required()
 def get_analytics():
-    """Get user analytics and insights"""
+    """Get user analytics"""
     try:
-        user_id = get_user_id()
-        profile = get_user_profile(user_id)
+        user_id = get_jwt_identity()
+        profile = load_profile_by_user_id(user_id)
         
-        # Calculate basic analytics
         metrics = profile['history'].get('health_metrics', [])
         goals = profile['history'].get('goals', [])
         
@@ -527,44 +603,45 @@ def get_analytics():
             'days_active': len(set(m['timestamp'][:10] for m in metrics if 'timestamp' in m))
         }
         
-        return jsonify({
-            'analytics': analytics,
-            'success': True
-        })
-        
+        return jsonify({'analytics': analytics, 'success': True})
     except Exception as e:
         logging.error(f"Analytics error: {e}")
-        return jsonify({
-            'error': 'Failed to generate analytics',
-            'success': False
-        }), 500
+        return jsonify({'error': 'Failed to generate analytics', 'success': False}), 500
 
-# ======================= MAIN =======================
-
+# ---------------------------
+# MAIN
+# ---------------------------
 if __name__ == '__main__':
     print("=" * 60)
-    print("🏃 SMART HEALTH COACH - BACKEND SERVER")
+    print("💜 SMART HEALTH COACH AI - BACKEND SERVER")
     print("=" * 60)
     print(f"✅ Status: {'Ready' if client else '⚠️  API Key Missing'}")
     print(f"🔑 Groq API: {'Configured' if api_key else 'Not configured'}")
     print(f"🌐 Server: http://localhost:5001")
+    print(f"🔐 JWT: {'Configured' if os.getenv('JWT_SECRET_KEY') else 'Using default (change this!)'}")
     print("\n📋 Available Endpoints:")
-    print("   POST   /api/chat                - Chat with health coach")
+    print("   POST   /api/auth/register       - Register new user")
+    print("   POST   /api/auth/login          - Login (returns access_token)")
+    print("   GET    /api/auth/me             - Get current user")
+    print("   POST   /api/auth/logout         - Logout")
+    print("   POST   /api/chat                - Chat with AI coach")
     print("   GET    /api/health              - Health check")
-    print("   GET    /api/profile             - Get user profile")
-    print("   POST   /api/profile             - Update profile")
-    print("   GET    /api/metrics             - Get health metrics")
-    print("   POST   /api/metrics             - Log health metrics")
-    print("   POST   /api/workout/generate    - Generate workout plan")
+    print("   GET/POST /api/profile           - Get/update profile")
+    print("   GET/POST /api/metrics           - Health metrics")
+    print("   POST   /api/workout/generate    - Generate workout")
     print("   POST   /api/meal-plan/generate  - Generate meal plan")
-    print("   GET    /api/goals               - Get health goals")
-    print("   POST   /api/goals               - Create new goal")
-    print("   GET    /api/analytics           - Get user analytics")
-    print("\n💡 Tips:")
-    print("   - Set GROQ_API_KEY in .env file")
-    print("   - Get free API key: https://console.groq.com/keys")
-    print("   - Logs saved to: logs/ directory")
-    print("   - User data saved to: user_data/ directory")
+    print("   GET/POST /api/goals             - Manage goals")
+    print("   GET    /api/analytics           - User analytics")
+    print("\n💡 Setup Instructions:")
+    print("   1. Create a .env file with:")
+    print("      GROQ_API_KEY=your_groq_api_key_here")
+    print("      JWT_SECRET_KEY=your_secret_key_here")
+    print("   2. Install dependencies: pip install flask flask-cors flask-jwt-extended groq python-dotenv werkzeug")
+    print("   3. Run: python app.py")
+    print("\n📁 Data Storage:")
+    print("   - Users: users.json")
+    print("   - Profiles: user_data/")
+    print("   - Logs: logs/")
     print("=" * 60)
     print()
     
