@@ -7,3 +7,4 @@ python-dotenv==1.0.0
 lancedb
 gunicorn
 groq
+flask-jwt-extended==4.4.4
