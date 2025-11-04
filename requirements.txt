@@ -1,10 +1,10 @@
 
-flask==3.0.0
-flask-cors==4.0.0
-google-generativeai==0.3.2
-chromadb==0.4.22
-python-dotenv==1.0.0
+flask
+flask-cors
+google-generativeai
+python-dotenv
 lancedb
 gunicorn
 groq
 flask-jwt-extended==4.4.4
+werkzeug==3.0.1
